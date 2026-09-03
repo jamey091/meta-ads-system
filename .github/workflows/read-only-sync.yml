@@ -1,0 +1,46 @@
+name: Read-only Meta ads sync and recommendations
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meta-ads-read-only-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-and-recommend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: meta-ads-read-only
+    env:
+      DRY_RUN: "true"
+      META_WRITE_ENABLED: "false"
+      META_BUDGET_WRITES_ENABLED: "false"
+      META_ACTIVATION_WRITES_ENABLED: "false"
+      META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+      META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+      SUPABASE_URL_BACKOFFICE: ${{ secrets.SUPABASE_URL_BACKOFFICE }}
+      SUPABASE_SERVICE_KEY_BACKOFFICE: ${{ secrets.SUPABASE_SERVICE_KEY_BACKOFFICE }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Validate configuration without network calls
+        run: python -m scripts.check_config
+      - name: Sync performance data
+        run: python -m scripts.sync_to_supabase
+      - name: Generate approval-required recommendations
+        run: python -m scripts.auto_rules
+
+      # Deliberately absent: scripts.process_actions. Phase 1/2 never schedules
+      # Meta mutations or autonomous budget changes.

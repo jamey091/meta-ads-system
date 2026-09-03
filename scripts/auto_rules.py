@@ -2,7 +2,7 @@
 Automated Rules Engine — Runs every 2 hours after sync.
 
 Evaluates all active ads against kill/graduate rules and queues
-actions in the Supabase ads_action_queue for execution.
+recommendations in the Supabase ads_action_queue for human review.
 
 Rules:
   KILL:  Spent >= 2x target CPL with 0 conversions → pause ad
@@ -10,7 +10,7 @@ Rules:
   KILL:  Frequency > 4.0 (creative fatigue) → pause ad
   GRAD:  CPL <= target for 7+ days with 5+ conversions → notify for graduation
 
-Actions are queued in Supabase and executed by process_actions.py.
+Recommendations are never executable until a human explicitly approves them.
 Notifications are sent to Telegram.
 
 Usage:
@@ -27,6 +27,7 @@ from typing import Any, Dict, List
 
 import requests
 from dotenv import load_dotenv
+from config.audit import audit_event
 
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -90,7 +91,7 @@ def send_telegram(text: str) -> bool:
 
 def queue_action(action_type: str, entity_id: str, entity_name: str,
                  reason: str, params: Dict | None = None) -> bool:
-    """Queue an action in the Supabase ads_action_queue."""
+    """Store a non-executable recommendation for human review."""
     merged_params = params or {}
     merged_params["reason"] = reason
     row = {
@@ -98,7 +99,8 @@ def queue_action(action_type: str, entity_id: str, entity_name: str,
         "entity_id": entity_id,
         "entity_name": f"[auto] {entity_name}",
         "params": json.dumps(merged_params),
-        "status": "pending",
+        "status": "recommended",
+        "requested_by": "rules_engine",
     }
     try:
         r = requests.post(
@@ -108,7 +110,10 @@ def queue_action(action_type: str, entity_id: str, entity_name: str,
             timeout=10,
         )
         if r.status_code in (200, 201, 204):
-            logger.info("Queued action: %s → %s (%s)", action_type, entity_name, reason)
+            audit_event("recommendation_created", action_type=action_type,
+                        entity_id=entity_id, entity_name=entity_name, reason=reason,
+                        metrics=merged_params)
+            logger.info("Recommendation created: %s → %s (%s)", action_type, entity_name, reason)
             return True
         else:
             logger.error("Failed to queue action: %d %s", r.status_code, r.text[:200])
@@ -209,14 +214,14 @@ def get_ad_performance() -> List[Dict[str, Any]]:
 
 
 def check_already_queued(entity_id: str) -> bool:
-    """Check if there's already a pending action for this entity."""
+    """Check for an existing unprocessed recommendation or approval."""
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/ads_action_queue",
             headers=_sb_headers(),
             params={
                 "entity_id": f"eq.{entity_id}",
-                "status": "eq.pending",
+                "status": "in.(recommended,approved,processing)",
             },
             timeout=10,
         )
@@ -315,7 +320,7 @@ def evaluate_rules(ads: List[Dict[str, Any]]) -> Dict[str, List[Dict]]:
 
 
 def execute_kills(kills: List[Dict]) -> int:
-    """Queue pause actions for all kill decisions."""
+    """Create approval-required pause recommendations for kill decisions."""
     queued = 0
     for kill in kills:
         success = queue_action(
@@ -416,7 +421,7 @@ def notify_results(kills: List[Dict], graduates: List[Dict], alerts: List[Dict])
     lines = ["🤖 *Auto Rules Engine*\n"]
 
     if kills:
-        lines.append(f"*🔴 {len(kills)} ad(s) paused:*")
+        lines.append(f"*🔴 {len(kills)} ad pause recommendation(s):*")
         for k in kills:
             lines.append(f"  • _{k['ad_name']}_")
             lines.append(f"    {k['reason']}")
@@ -503,8 +508,7 @@ def budget_guardian():
     """Budget Guardian — runs every hour to enforce hard spending limits.
 
     Reads limits from knowledge/budget-rules.md.
-    If any ad set exceeds the max, pauses it immediately.
-    If total daily spend exceeds the cap, pauses everything.
+    It only creates approval-required recommendations; it never pauses ads.
     """
     # Hard caps (from budget-rules.md)
     MAX_DAILY_TOTAL = 120.00      # €120/day across all ad sets
@@ -522,17 +526,17 @@ def budget_guardian():
     rows = r.json().get("data", [])
     today_spend = float(rows[0].get("spend", 0)) if rows else 0
 
-    # EMERGENCY: if today's spend already exceeds the emergency limit, pause everything
+    # EMERGENCY: recommend pausing active ad sets; never mutate Meta here.
     if today_spend > EMERGENCY_PAUSE_AT:
-        logger.error("EMERGENCY: today's spend €%.2f exceeds €%.0f — pausing ALL ads", today_spend, EMERGENCY_PAUSE_AT)
+        logger.error("EMERGENCY: today's spend €%.2f exceeds €%.0f — recommending pause", today_spend, EMERGENCY_PAUSE_AT)
         send_telegram(
             f"🚨 *EMERGENCY — Budget Guardian*\n\n"
             f"Today's spend: €{today_spend:.2f} (limit: €{EMERGENCY_PAUSE_AT:.0f})\n\n"
-            f"*Pausing all ad sets NOW.*\n"
-            f"Fix budgets in Ads Manager, then reactivate."
+            f"*Human approval required before any pause.*\n"
+            f"Review budgets and recommendations in the dashboard."
         )
 
-        # Pause all active ad sets
+        # Create one recommendation for each active ad set
         r = requests.get(
             f"{GRAPH_BASE}/{META_AD_ACCOUNT_ID}/adsets",
             params={
@@ -544,12 +548,11 @@ def budget_guardian():
             timeout=15,
         )
         for adset in r.json().get("data", []):
-            requests.post(
-                f"{GRAPH_BASE}/{adset['id']}",
-                data={"status": "PAUSED", "access_token": META_ACCESS_TOKEN},
-                timeout=15,
+            queue_action(
+                "pause_adset", adset["id"], adset.get("name", adset["id"]),
+                f"Emergency spend recommendation: today €{today_spend:.2f} > €{EMERGENCY_PAUSE_AT:.2f}",
+                {"today_spend": today_spend, "threshold": EMERGENCY_PAUSE_AT},
             )
-            logger.info("  PAUSED: %s", adset.get("name", adset["id"]))
         return
 
     # Check each ad set's budget against the cap
@@ -614,10 +617,10 @@ def main():
         len(kills), len(graduates), len(alerts),
     )
 
-    # 3. Execute kills (queue in Supabase)
+    # 3. Create recommendations (never execute here)
     if kills:
         queued = execute_kills(kills)
-        logger.info("Queued %d pause actions", queued)
+        logger.info("Created %d pause recommendations", queued)
 
     # 4. Handle graduates — notify + queue creative variations
     for grad in graduates:
@@ -633,7 +636,7 @@ def main():
     except Exception:
         logger.exception("Budget check failed (non-critical)")
 
-    # 7. Budget Guardian — enforce hard spending limits
+    # 7. Budget Guardian — detect limit breaches and recommend actions
     try:
         budget_guardian()
     except Exception:
@@ -643,7 +646,7 @@ def main():
     print(f"\n{'='*50}")
     print(f"Auto Rules Summary:")
     print(f"  Ads evaluated: {len(ads)}")
-    print(f"  Kills queued:  {len(kills)}")
+    print(f"  Pause recommendations: {len(kills)}")
     print(f"  Winners found: {len(graduates)}")
     print(f"  Alerts:        {len(alerts)}")
     print(f"{'='*50}")

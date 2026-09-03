@@ -17,6 +17,7 @@ from facebook_business.exceptions import FacebookRequestError
 
 from api.meta_client import MetaClient
 from config.settings import META_AD_ACCOUNT_ID
+from config.safety import block_direct_write
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ def upload_image(image_path: str) -> dict[str, Any]:
     if not os.path.isfile(image_path):
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
+    block_direct_write("upload_image")
     client = MetaClient()
     image = AdImage(parent_id=META_AD_ACCOUNT_ID)
     image[AdImage.Field.filename] = image_path
@@ -112,6 +114,7 @@ def upload_video(video_path: str, wait_for_encoding: bool = True) -> dict[str, A
     if not os.path.isfile(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
+    block_direct_write("upload_video")
     client = MetaClient()
     account = client.get_account()
 
@@ -240,6 +243,7 @@ def create_creative(
     dict
         Created creative metadata including ``id``.
     """
+    block_direct_write("create_creative")
     client = MetaClient()
     account = client.get_account()
 
