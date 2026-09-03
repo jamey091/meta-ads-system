@@ -19,6 +19,7 @@ from facebook_business.exceptions import FacebookRequestError
 
 from api.meta_client import MetaClient
 from config.settings import META_AD_ACCOUNT_ID
+from config.safety import block_direct_write
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ def create_campaign(
     dict
         Created campaign metadata including ``id``.
     """
+    block_direct_write("create_campaign")
     client = MetaClient()
     account = client.get_account()
 
@@ -277,6 +279,7 @@ def create_adset(
     dict
         Created ad set metadata including ``id``.
     """
+    block_direct_write("create_adset")
     client = MetaClient()
     account = client.get_account()
 
@@ -410,6 +413,7 @@ def create_ad(
     dict
         Created ad metadata including ``id``.
     """
+    block_direct_write("create_ad")
     client = MetaClient()
     account = client.get_account()
 
@@ -513,6 +517,7 @@ def pause_ad(ad_id: str) -> dict[str, Any]:
     dict
         Updated ad data.
     """
+    block_direct_write("pause_ad")
     client = MetaClient()
     ad = Ad(ad_id)
 
@@ -543,6 +548,7 @@ def activate_ad(ad_id: str) -> dict[str, Any]:
     dict
         Updated ad data.
     """
+    block_direct_write("activate_ad")
     client = MetaClient()
     ad = Ad(ad_id)
 
@@ -573,6 +579,7 @@ def pause_adset(adset_id: str) -> dict[str, Any]:
     dict
         Updated ad set data.
     """
+    block_direct_write("pause_adset")
     client = MetaClient()
     adset = AdSet(adset_id)
 
@@ -603,6 +610,7 @@ def activate_adset(adset_id: str) -> dict[str, Any]:
     dict
         Updated ad set data.
     """
+    block_direct_write("activate_adset")
     client = MetaClient()
     adset = AdSet(adset_id)
 
@@ -646,6 +654,7 @@ def update_budget(
     dict
         Confirmation with old and new budget information.
     """
+    block_direct_write("update_budget")
     client = MetaClient()
     budget_cents = str(int(round(new_budget * 100)))
 

@@ -1,8 +1,8 @@
 """
 Process ads action queue from Supabase.
 
-Reads pending actions from `ads_action_queue`, executes them against
-the Meta Graph API, and updates the status.
+Reads explicitly approved actions from `ads_action_queue`. Default settings
+simulate and audit actions without contacting Meta.
 
 Can be run standalone or triggered from GitHub Actions.
 
@@ -16,10 +16,12 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests
 from dotenv import load_dotenv
+from config.audit import audit_event
+from config.safety import SafetyError, SafetyPolicy, authorize_action, validate_read_environment
 
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -50,8 +52,8 @@ def _sb_headers() -> Dict[str, str]:
 
 def _meta_post(entity_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """POST to Meta Graph API."""
-    data["access_token"] = META_ACCESS_TOKEN
-    r = requests.post(f"{GRAPH_BASE}/{entity_id}", data=data, timeout=15)
+    r = requests.post(f"{GRAPH_BASE}/{entity_id}", data={**data, "access_token": META_ACCESS_TOKEN}, timeout=15)
+    r.raise_for_status()
     return r.json()
 
 
@@ -69,8 +71,8 @@ def _update_action(action_id: str, status: str, result: str) -> None:
     )
 
 
-def _get_pending_actions() -> List[Dict[str, Any]]:
-    """Fetch all pending actions from the queue."""
+def _get_approved_actions() -> List[Dict[str, Any]]:
+    """Fetch approved actions only; recommendations are never executable."""
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/ads_action_queue",
         headers={
@@ -78,13 +80,15 @@ def _get_pending_actions() -> List[Dict[str, Any]]:
             "Authorization": f"Bearer {SUPABASE_KEY}",
         },
         params={
-            "status": "eq.pending",
+            "status": "eq.approved",
             "order": "requested_at.asc",
         },
         timeout=10,
     )
     if r.status_code == 200:
         return r.json()
+    else:
+        r.raise_for_status()
     return []
 
 
@@ -194,9 +198,10 @@ HANDLERS = {
 
 
 def process_all() -> Dict[str, Any]:
-    """Process all pending actions in the queue."""
-    actions = _get_pending_actions()
-    logger.info("Found %d pending actions", len(actions))
+    """Process approved actions after applying the fail-closed safety policy."""
+    policy = SafetyPolicy.from_env()
+    actions = _get_approved_actions()
+    logger.info("Found %d approved actions (dry_run=%s)", len(actions), policy.dry_run)
 
     results = {"processed": 0, "failed": 0, "skipped": 0}
 
@@ -212,17 +217,36 @@ def process_all() -> Dict[str, Any]:
             results["skipped"] += 1
             continue
 
-        logger.info("Processing: %s → %s", action_type, entity_name)
-        _update_action(action_id, "processing", "")
-
         try:
+            if policy.dry_run:
+                audit_event("execution_simulated", action_id=action_id, action_type=action_type,
+                            entity_id=action.get("entity_id"), approval_id=action.get("approval_id"))
+                logger.info("DRY RUN: would process %s -> %s", action_type, entity_name)
+                results["skipped"] += 1
+                continue
+            authorize_action(action, policy)
+            _update_action(action_id, "processing", "")
+            audit_event("execution_started", action_id=action_id, action_type=action_type,
+                        entity_id=action.get("entity_id"), approval_id=action.get("approval_id"),
+                        approved_by=action.get("approved_by"))
             result_msg = handler(action)
             _update_action(action_id, "completed", result_msg)
+            audit_event("execution_completed", action_id=action_id, action_type=action_type,
+                        entity_id=action.get("entity_id"), result=result_msg)
             logger.info("  ✅ %s", result_msg)
             results["processed"] += 1
+        except SafetyError as exc:
+            error_msg = f"Safety policy blocked execution: {exc}"
+            _update_action(action_id, "blocked", error_msg)
+            audit_event("execution_blocked", action_id=action_id, action_type=action_type,
+                        entity_id=action.get("entity_id"), reason=str(exc))
+            logger.warning("  BLOCKED %s", error_msg)
+            results["skipped"] += 1
         except Exception as exc:
             error_msg = str(exc)
             _update_action(action_id, "failed", error_msg)
+            audit_event("execution_failed", action_id=action_id, action_type=action_type,
+                        entity_id=action.get("entity_id"), error=error_msg)
             logger.error("  ❌ %s", error_msg)
             results["failed"] += 1
 
@@ -232,8 +256,11 @@ def process_all() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    if not META_ACCESS_TOKEN or not SUPABASE_URL:
-        logger.error("Missing META_ACCESS_TOKEN or SUPABASE_URL_BACKOFFICE")
+    errors = validate_read_environment()
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        errors.append("Supabase backoffice URL and service key are required")
+    if errors:
+        logger.error("Configuration invalid: %s", "; ".join(errors))
         exit(1)
 
     results = process_all()

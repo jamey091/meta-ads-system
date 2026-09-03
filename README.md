@@ -1,5 +1,9 @@
 # Meta Ads Automation System
 
+> **Safety fork:** Meta writes are disabled by default. Rules create
+> recommendations requiring explicit, attributable approval. Start with
+> [SAFE_MODE.md](SAFE_MODE.md); do not grant `ads_management` for Phase 1.
+
 An open-source, AI-powered Meta (Facebook/Instagram) ads automation system. Built for solo founders and small teams who want to run high-performance ad campaigns without an agency.
 
 **What it does:**
